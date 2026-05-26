@@ -1,0 +1,315 @@
+name: Release Node Only
+
+on:
+  push:
+    tags: ["node-v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  LIBKRUNFW_VERSION: "5.2.1"
+  LIBKRUNFW_ABI: "5"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-kernel:
+    name: Build kernel.c (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Cache kernel.c
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: vendor/libkrunfw/kernel.c
+          key: kernel-c-aarch64-${{ hashFiles('vendor/libkrunfw/**') }}
+
+      - name: Install kernel build deps
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      - name: Build kernel.c
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          cd vendor/libkrunfw
+          make -j$(nproc)
+
+      - name: Upload kernel.c
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-c-aarch64
+          path: vendor/libkrunfw/kernel.c
+
+  build-agentd-aarch64:
+    name: Build agentd (aarch64-linux-musl)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+
+      - name: Install agentd build deps
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build agentd
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          cargo build --release --manifest-path crates/agentd/Cargo.toml --target aarch64-unknown-linux-musl
+          mkdir -p build
+          cp crates/agentd/target/aarch64-unknown-linux-musl/release/agentd build/agentd
+
+      - name: Upload agentd
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentd-aarch64-linux-musl
+          path: build/agentd
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [build-kernel, build-agentd-aarch64]
+    if: always()
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-latest
+            arch: x86_64
+            os: linux
+            agentd_target: x86_64-unknown-linux-musl
+            napi_target: x86_64-unknown-linux-gnu
+            node_file: microsandbox.linux-x64-gnu.node
+            npm_dir: linux-x64-gnu
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            arch: aarch64
+            os: linux
+            agentd_target: aarch64-unknown-linux-musl
+            napi_target: aarch64-unknown-linux-gnu
+            node_file: microsandbox.linux-arm64-gnu.node
+            npm_dir: linux-arm64-gnu
+          - target: darwin-aarch64
+            runner: macos-14
+            arch: aarch64
+            os: darwin
+            agentd_target: ""
+            napi_target: aarch64-apple-darwin
+            node_file: microsandbox.darwin-arm64.node
+            npm_dir: darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+
+      - name: Install build deps (Linux)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      - name: Build agentd (musl)
+        if: matrix.os == 'linux'
+        run: |
+          rustup target add ${{ matrix.agentd_target }}
+          cargo build --release --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.agentd_target }}
+          mkdir -p build
+          cp crates/agentd/target/${{ matrix.agentd_target }}/release/agentd build/agentd
+
+      - name: Download agentd (macOS)
+        if: matrix.os == 'darwin'
+        uses: actions/download-artifact@v4
+        with:
+          name: agentd-aarch64-linux-musl
+          path: build/
+
+      - name: Cache libkrunfw
+        id: cache-libkrunfw
+        uses: actions/cache@v4
+        with:
+          path: build/libkrunfw*
+          key: libkrunfw-${{ matrix.target }}-${{ hashFiles('vendor/libkrunfw/**') }}
+
+      - name: Build libkrunfw (Linux)
+        if: steps.cache-libkrunfw.outputs.cache-hit != 'true' && matrix.os == 'linux'
+        run: |
+          cd vendor/libkrunfw
+          make -j$(nproc)
+          cd ../..
+          mkdir -p build
+          cp vendor/libkrunfw/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }} build/
+          cd build
+          ln -sf libkrunfw.so.${{ env.LIBKRUNFW_VERSION }} libkrunfw.so.${{ env.LIBKRUNFW_ABI }}
+          ln -sf libkrunfw.so.${{ env.LIBKRUNFW_ABI }} libkrunfw.so
+
+      - name: Download kernel.c (macOS)
+        if: steps.cache-libkrunfw.outputs.cache-hit != 'true' && matrix.os == 'darwin'
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-c-aarch64
+          path: vendor/libkrunfw/
+
+      - name: Build libkrunfw (macOS)
+        if: steps.cache-libkrunfw.outputs.cache-hit != 'true' && matrix.os == 'darwin'
+        run: |
+          cd vendor/libkrunfw
+          cc -fPIC -DABI_VERSION=${{ env.LIBKRUNFW_ABI }} -shared -o libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib kernel.c
+          cd ../..
+          mkdir -p build
+          cp vendor/libkrunfw/libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib build/
+          cd build
+          ln -sf libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib libkrunfw.dylib
+
+      - name: Build msb
+        run: |
+          cargo build --release --no-default-features --features net -p microsandbox-cli
+          mkdir -p build
+          cp target/release/msb build/msb
+
+      - name: Codesign msb
+        if: matrix.os == 'darwin'
+        run: codesign --entitlements msb-entitlements.plist --force -s - build/msb
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build Node SDK
+        working-directory: sdk/node-ts
+        run: |
+          npm install
+          npm run build:native -- --target ${{ matrix.napi_target }}
+          npm run build:ts
+
+      - name: Prepare Node platform package
+        working-directory: sdk/node-ts
+        run: node scripts/prepare-platform-package.mjs ${{ matrix.npm_dir }}
+
+      - name: Upload Node SDK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-sdk-${{ matrix.npm_dir }}
+          path: |
+            sdk/node-ts/native/${{ matrix.node_file }}
+            sdk/node-ts/native/index.cjs
+            sdk/node-ts/native/index.d.ts
+            sdk/node-ts/npm/${{ matrix.npm_dir }}/${{ matrix.node_file }}
+            sdk/node-ts/npm/${{ matrix.npm_dir }}/bin/msb
+            sdk/node-ts/npm/${{ matrix.npm_dir }}/lib/*
+
+  npm-publish:
+    name: Publish npm packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: "@venbrinodev"
+
+      - name: Download Node SDK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: node-artifacts
+          pattern: node-sdk-*
+
+      - name: Place binaries and update generated files
+        run: |
+          for dir in darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
+            mkdir -p "sdk/node-ts/npm/$dir/bin" "sdk/node-ts/npm/$dir/lib"
+            cp "node-artifacts/node-sdk-$dir/npm/$dir"/microsandbox.*.node "sdk/node-ts/npm/$dir/"
+            cp "node-artifacts/node-sdk-$dir/npm/$dir/bin/msb" "sdk/node-ts/npm/$dir/bin/"
+            cp "node-artifacts/node-sdk-$dir/npm/$dir/lib/"* "sdk/node-ts/npm/$dir/lib/"
+            chmod +x "sdk/node-ts/npm/$dir/bin/msb"
+          done
+
+          cp node-artifacts/node-sdk-darwin-arm64/native/index.cjs sdk/node-ts/native/index.cjs
+          cp node-artifacts/node-sdk-darwin-arm64/native/index.d.ts sdk/node-ts/native/index.d.cts
+
+      - name: Build TypeScript output (root package dist/)
+        working-directory: sdk/node-ts
+        run: |
+          npm install
+          npm run build:ts
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for dir in darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
+            echo "Publishing @venbrinodev/microsandbox-$dir..."
+            cd sdk/node-ts/npm/$dir
+            npm publish
+            cd ../../../..
+          done
+
+      - name: Wait for GitHub Packages to index platform packages
+        run: sleep 30
+
+      - name: Publish root package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: sdk/node-ts
+        run: npm publish
+
+  refresh-lockfile:
+    name: Refresh npm lockfile
+    needs: npm-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: "@venbrinodev"
+
+      - name: Wait for GitHub Packages to index platform packages
+        run: sleep 60
+
+      - name: Regenerate lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: sdk/node-ts
+        run: npm install --package-lock-only --ignore-scripts
+
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          title: "chore: refresh npm lockfile after ${{ github.ref_name }}"
+          body: |
+            Regenerates `sdk/node-ts/package-lock.json` against the platform packages published for ${{ github.ref_name }}, so `npm ci` keeps working on release.
+          branch: refresh-lockfile-${{ github.ref_name }}
+          commit-message: "chore: refresh npm lockfile after ${{ github.ref_name }}"
+          base: release
+          add-paths: sdk/node-ts/package-lock.json
+          delete-branch: true
