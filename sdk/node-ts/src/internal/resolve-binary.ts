@@ -30,7 +30,7 @@ function resolvePlatformRoot(): string | null {
     try {
       const r = createRequire(base);
       const pkgPath = r.resolve(
-        `@superradcompany/microsandbox-${triple}/package.json`,
+        `@venbrinodev/microsandbox-${triple}/package.json`,
       );
       const root = dirname(pkgPath);
       // Only accept this base if it actually carries the bundled binaries —

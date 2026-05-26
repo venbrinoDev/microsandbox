@@ -392,7 +392,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
+          registry-url: https://npm.pkg.github.com
+          scope: "@venbrinodev"
 
       - name: Download Node SDK artifacts
         uses: actions/download-artifact@v4
@@ -428,12 +429,12 @@ jobs:
 
       - name: Publish platform packages
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           for dir in darwin-arm64 linux-x64-gnu linux-arm64-gnu; do
-            echo "Publishing @superradcompany/microsandbox-$dir..."
+            echo "Publishing @venbrinodev/microsandbox-$dir..."
             cd sdk/node-ts/npm/$dir
-            npm publish --access public
+            npm publish
             cd ../../../..
           done
 
@@ -442,9 +443,9 @@ jobs:
 
       - name: Publish root package
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: sdk/node-ts
-        run: npm publish --access public
+        run: npm publish
 
   # ---------------------------------------------------------------------------
   # Refresh sdk/node-ts/package-lock.json against the just-published platform
@@ -466,11 +467,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: "@venbrinodev"
 
       - name: Wait for npm to index platform packages
         run: sleep 60
 
       - name: Regenerate lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: sdk/node-ts
         run: npm install --package-lock-only --ignore-scripts
 

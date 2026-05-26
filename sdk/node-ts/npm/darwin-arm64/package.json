@@ -1,5 +1,5 @@
 {
-  "name": "@superradcompany/microsandbox-darwin-arm64",
+  "name": "@venbrinodev/microsandbox-darwin-arm64",
   "version": "0.4.6",
   "description": "Bundled msb + libkrunfw + napi binding for microsandbox on macOS arm64.",
   "os": ["darwin"],

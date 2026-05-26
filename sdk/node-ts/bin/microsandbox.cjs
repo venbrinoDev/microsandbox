@@ -21,7 +21,7 @@ function resolveMsb() {
   if (triple) {
     try {
       const pkgPath = require.resolve(
-        `@superradcompany/microsandbox-${triple}/package.json`,
+        `@venbrinodev/microsandbox-${triple}/package.json`,
       );
       const candidate = path.join(path.dirname(pkgPath), "bin", "msb");
       if (fs.existsSync(candidate)) {
