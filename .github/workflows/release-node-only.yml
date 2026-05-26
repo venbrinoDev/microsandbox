@@ -281,7 +281,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
       packages: read
     steps:
       - uses: actions/checkout@v4
@@ -303,13 +302,14 @@ jobs:
         working-directory: sdk/node-ts
         run: npm install --package-lock-only --ignore-scripts
 
-      - uses: peter-evans/create-pull-request@v7
-        with:
-          title: "chore: refresh npm lockfile after ${{ github.ref_name }}"
-          body: |
-            Regenerates `sdk/node-ts/package-lock.json` against the platform packages published for ${{ github.ref_name }}, so `npm ci` keeps working on release.
-          branch: refresh-lockfile-${{ github.ref_name }}
-          commit-message: "chore: refresh npm lockfile after ${{ github.ref_name }}"
-          base: release
-          add-paths: sdk/node-ts/package-lock.json
-          delete-branch: true
+      - name: Commit refreshed lockfile to release
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sdk/node-ts/package-lock.json
+          if git diff --cached --quiet; then
+            echo "No lockfile changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: refresh npm lockfile after ${{ github.ref_name }}"
+          git push origin HEAD:release
