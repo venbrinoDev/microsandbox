@@ -24,9 +24,9 @@ hickory-proto = { workspace = true, features = ["tls-ring"] }
 ipnetwork = { workspace = true }
 libc = { workspace = true }
 lru = { workspace = true }
-microsandbox-protocol = { version = "0.4.6", path = "../protocol" }
-microsandbox-utils = { version = "0.4.6", path = "../utils" }
-msb_krun = { version = "0.1.12", features = ["net"] }
+microsandbox-protocol = { version = "0.5.1", path = "../protocol" }
+microsandbox-utils = { version = "0.5.1", path = "../utils" }
+msb_krun = { version = "0.1.13", features = ["net"] }
 parking_lot = { workspace = true }
 pem = "3"
 percent-encoding = "2"
