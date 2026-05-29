@@ -38,6 +38,7 @@ use microsandbox_image::{
     progress_channel, tree,
 };
 
+use crate::{MicrosandboxError, runtime};
 use crate::{
     MicrosandboxResult,
     agent::AgentClient,
@@ -52,6 +53,17 @@ use crate::{
 
 use self::attach::AttachOptions;
 use self::exec::{ExecEvent, ExecHandle, ExecOptions, ExecSink, StdinMode};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Maximum UTF-8 byte length for a sandbox name.
+///
+/// The limit matches the fixed inline name storage in the shared-memory
+/// metrics slot, so SDK names can be copied into live metrics without
+/// truncation.
+pub const MAX_SANDBOX_NAME_BYTES: usize = microsandbox_metrics::SLOT_NAME_BYTES;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
@@ -117,6 +129,8 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Start building a new sandbox configuration.
+    ///
+    /// Sandbox names are limited to 128 UTF-8 bytes.
     pub fn builder(name: impl Into<String>) -> SandboxBuilder {
         SandboxBuilder::new(name)
     }
@@ -180,6 +194,8 @@ impl Sandbox {
 
     /// Start an existing stopped sandbox from persisted state.
     ///
+    /// Sandbox names are limited to 128 UTF-8 bytes.
+    ///
     /// Reuses the serialized sandbox config and pinned rootfs state without
     /// re-resolving the original OCI reference.
     pub async fn start(name: &str) -> MicrosandboxResult<Self> {
@@ -187,6 +203,8 @@ impl Sandbox {
     }
 
     /// Start an existing sandbox in detached/background mode.
+    ///
+    /// Sandbox names are limited to 128 UTF-8 bytes.
     pub async fn start_detached(name: &str) -> MicrosandboxResult<Self> {
         Self::start_with_mode(name, SpawnMode::Detached).await
     }
@@ -210,6 +228,7 @@ impl Sandbox {
 
         config.apply_rootfs_defaults();
         config.apply_runtime_defaults();
+        validate_sandbox_name_for_runtime(&config.name)?;
         validate_rootfs_source(&config.image)?;
 
         // Initialize the database before any expensive image pull so we can
@@ -224,7 +243,7 @@ impl Sandbox {
             let upper_size_mib = oci.upper_size_mib;
             let snapshot_manifest_digest = if config.snapshot_upper_source.is_some() {
                 Some(config.manifest_digest.clone().ok_or_else(|| {
-                    crate::MicrosandboxError::InvalidConfig(
+                    MicrosandboxError::InvalidConfig(
                         "from_snapshot requires a pinned OCI manifest digest".into(),
                     )
                 })?)
@@ -246,7 +265,7 @@ impl Sandbox {
             if let Some(expected) = snapshot_manifest_digest.as_deref()
                 && resolved_manifest_digest != expected
             {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                return Err(MicrosandboxError::InvalidConfig(format!(
                     "from_snapshot pinned OCI manifest digest '{expected}', but '{reference}' resolved to '{resolved_manifest_digest}'"
                 )));
             }
@@ -263,7 +282,7 @@ impl Sandbox {
 
             let vmdk_path = cache.vmdk_path(&pull_result.manifest_digest);
             if tokio::fs::metadata(&vmdk_path).await.is_err() {
-                return Err(crate::MicrosandboxError::Custom(format!(
+                return Err(MicrosandboxError::Custom(format!(
                     "VMDK not materialized: {}",
                     vmdk_path.display()
                 )));
@@ -291,7 +310,7 @@ impl Sandbox {
                 // compatible with this path because they'd need to be
                 // re-baked into the snapshot's upper, which we don't do.
                 if upper_tree.is_some() {
-                    return Err(crate::MicrosandboxError::InvalidConfig(
+                    return Err(MicrosandboxError::InvalidConfig(
                         "patches cannot be combined with from_snapshot".into(),
                     ));
                 }
@@ -300,12 +319,10 @@ impl Sandbox {
                     microsandbox_utils::copy::fast_copy(&snap_upper, &dst)
                 })
                 .await
-                .map_err(|e| {
-                    crate::MicrosandboxError::Custom(format!("snapshot copy task: {e}"))
-                })??;
+                .map_err(|e| MicrosandboxError::Custom(format!("snapshot copy task: {e}")))??;
             } else if !upper_path.exists() || upper_tree.is_some() {
                 let upper_size_mib = upper_size_mib.ok_or_else(|| {
-                    crate::MicrosandboxError::InvalidConfig(
+                    MicrosandboxError::InvalidConfig(
                         "OCI upper size was not resolved before create".into(),
                     )
                 })?;
@@ -384,7 +401,7 @@ impl Sandbox {
                         None,
                         microsandbox_metrics::ReleaseMode::Free,
                     );
-                    return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                    return Err(MicrosandboxError::InvalidConfig(format!(
                         "workdir is not a directory in guest: {workdir}"
                     )));
                 }
@@ -397,7 +414,7 @@ impl Sandbox {
                         None,
                         microsandbox_metrics::ReleaseMode::Free,
                     );
-                    return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                    return Err(MicrosandboxError::InvalidConfig(format!(
                         "workdir does not exist in guest: {workdir}: {error}"
                     )));
                 }
@@ -408,6 +425,7 @@ impl Sandbox {
     }
 
     pub(super) async fn start_with_mode(name: &str, mode: SpawnMode) -> MicrosandboxResult<Self> {
+        validate_sandbox_name(name)?;
         tracing::debug!(sandbox = name, ?mode, "start_with_mode: loading record");
         let pools = db::init_global().await?;
         let write_db = pools.write();
@@ -415,13 +433,13 @@ impl Sandbox {
         tracing::debug!(sandbox = name, status = ?model.status, "start_with_mode: current status");
 
         if model.status == SandboxStatus::Running || model.status == SandboxStatus::Draining {
-            return Err(crate::MicrosandboxError::SandboxStillRunning(format!(
+            return Err(MicrosandboxError::SandboxStillRunning(format!(
                 "cannot start sandbox '{name}': already running"
             )));
         }
 
         if model.status != SandboxStatus::Stopped && model.status != SandboxStatus::Crashed {
-            return Err(crate::MicrosandboxError::Custom(format!(
+            return Err(MicrosandboxError::Custom(format!(
                 "cannot start sandbox '{name}': status is {:?} (expected Stopped or Crashed)",
                 model.status
             )));
@@ -429,6 +447,7 @@ impl Sandbox {
 
         let mut config: SandboxConfig = serde_json::from_str(&model.config)?;
         config.apply_runtime_defaults();
+        validate_sandbox_name_for_runtime(&config.name)?;
         validate_rootfs_source(&config.image)?;
         validate_start_state(&config, &crate::config::config().sandboxes_dir().join(name))?;
         update_sandbox_status(write_db, model.id, SandboxStatus::Running).await?;
@@ -471,14 +490,17 @@ impl Sandbox {
     }
 
     /// Get a sandbox handle by name from the database.
+    ///
+    /// Sandbox names are limited to 128 UTF-8 bytes.
     pub async fn get(name: &str) -> MicrosandboxResult<SandboxHandle> {
+        validate_sandbox_name(name)?;
         let pools = db::init_global().await?;
 
         let model = sandbox_entity::Entity::find()
             .filter(sandbox_entity::Column::Name.eq(name))
             .one(pools.read())
             .await?
-            .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(name.into()))?;
+            .ok_or_else(|| MicrosandboxError::SandboxNotFound(name.into()))?;
 
         let model = reconcile_sandbox_runtime_state(pools, model).await?;
         build_handle(pools.read(), model).await
@@ -515,6 +537,7 @@ impl Sandbox {
     /// Remove a stopped sandbox from the database.
     ///
     /// Convenience method equivalent to `Sandbox::get(name).await?.remove().await`.
+    /// Sandbox names are limited to 128 UTF-8 bytes.
     pub async fn remove(name: &str) -> MicrosandboxResult<()> {
         Self::get(name).await?.remove().await
     }
@@ -543,6 +566,8 @@ impl Sandbox {
     }
 
     /// Unique name identifying this sandbox.
+    ///
+    /// Sandbox names are limited to 128 UTF-8 bytes.
     pub fn name(&self) -> &str {
         &self.config.name
     }
@@ -645,7 +670,7 @@ impl Sandbox {
     pub async fn kill(&self) -> MicrosandboxResult<()> {
         match &self.handle {
             Some(h) => h.lock().await.kill(),
-            None => Err(crate::MicrosandboxError::Runtime(
+            None => Err(MicrosandboxError::Runtime(
                 "cannot kill: not the lifecycle owner".into(),
             )),
         }
@@ -655,7 +680,7 @@ impl Sandbox {
     pub async fn drain(&self) -> MicrosandboxResult<()> {
         match &self.handle {
             Some(h) => h.lock().await.drain(),
-            None => Err(crate::MicrosandboxError::Runtime(
+            None => Err(MicrosandboxError::Runtime(
                 "cannot drain: not the lifecycle owner".into(),
             )),
         }
@@ -665,7 +690,7 @@ impl Sandbox {
     pub async fn wait(&self) -> MicrosandboxResult<ExitStatus> {
         match &self.handle {
             Some(h) => h.lock().await.wait().await,
-            None => Err(crate::MicrosandboxError::Runtime(
+            None => Err(MicrosandboxError::Runtime(
                 "cannot wait: not the lifecycle owner".into(),
             )),
         }
@@ -850,7 +875,7 @@ impl Sandbox {
                             handle.collect(),
                         )
                         .await;
-                        Err(crate::MicrosandboxError::ExecTimeout(duration))
+                        Err(MicrosandboxError::ExecTimeout(duration))
                     }
                 }
             }
@@ -988,7 +1013,7 @@ impl Sandbox {
 
         // Enter raw mode.
         crossterm::terminal::enable_raw_mode()
-            .map_err(|e| crate::MicrosandboxError::Terminal(e.to_string()))?;
+            .map_err(|e| MicrosandboxError::Terminal(e.to_string()))?;
         let _raw_guard = scopeguard::guard((), |_| {
             let _ = crossterm::terminal::disable_raw_mode();
         });
@@ -998,17 +1023,17 @@ impl Sandbox {
         // stdout/stderr when all three stdio fds share the same TTY open file
         // description, which truncates large terminal writes.
         let tty_input_path = terminal_path_for_fd(std::io::stdin().as_raw_fd())
-            .map_err(|e| crate::MicrosandboxError::Terminal(format!("resolve tty path: {e}")))?;
+            .map_err(|e| MicrosandboxError::Terminal(format!("resolve tty path: {e}")))?;
         let tty_input = open_nonblocking_terminal_input(&tty_input_path)
-            .map_err(|e| crate::MicrosandboxError::Terminal(format!("open tty input: {e}")))?;
+            .map_err(|e| MicrosandboxError::Terminal(format!("open tty input: {e}")))?;
         let stdin_async = AsyncFd::new(tty_input)
-            .map_err(|e| crate::MicrosandboxError::Terminal(format!("async tty input: {e}")))?;
+            .map_err(|e| MicrosandboxError::Terminal(format!("async tty input: {e}")))?;
 
         // Set up async I/O.
         let mut stdout = tokio::io::stdout();
         let mut sigwinch =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-                .map_err(|e| crate::MicrosandboxError::Runtime(format!("sigwinch: {e}")))?;
+                .map_err(|e| MicrosandboxError::Runtime(format!("sigwinch: {e}")))?;
 
         let mut exit_code: i32 = -1;
         let mut spawn_failure: Option<microsandbox_protocol::exec::ExecFailed> = None;
@@ -1151,7 +1176,7 @@ impl Sandbox {
 
         // Guards restore: non-blocking → blocking, raw mode → cooked.
         if let Some(failure) = spawn_failure {
-            return Err(crate::MicrosandboxError::ExecFailed(failure));
+            return Err(MicrosandboxError::ExecFailed(failure));
         }
         Ok(exit_code)
     }
@@ -1217,7 +1242,7 @@ async fn wait_for_relay(
                     // Prefer the structured boot-error record if the
                     // sandbox got far enough to write one.
                     if let Some(boot_err) = read_boot_error(log_dir.as_deref()) {
-                        return Err(crate::MicrosandboxError::BootStart {
+                        return Err(MicrosandboxError::BootStart {
                             name: sandbox_name.to_string(),
                             err: boot_err,
                         });
@@ -1237,7 +1262,7 @@ async fn wait_for_relay(
                             "sandbox process exited ({status}) before agent relay became available"
                         ),
                     };
-                    return Err(crate::MicrosandboxError::BootStart {
+                    return Err(MicrosandboxError::BootStart {
                         name: sandbox_name.to_string(),
                         err: synthetic,
                     });
@@ -1261,7 +1286,7 @@ async fn wait_for_relay(
                 // typed record over the raw IO/timeout error so the CLI
                 // can render the styled boot-error block.
                 if let Some(boot_err) = read_boot_error(log_dir.as_deref()) {
-                    return Err(crate::MicrosandboxError::BootStart {
+                    return Err(MicrosandboxError::BootStart {
                         name: sandbox_name.to_string(),
                         err: boot_err,
                     });
@@ -1572,7 +1597,7 @@ pub(super) async fn reconcile_sandbox_runtime_state(
     sandbox_entity::Entity::find_by_id(sandbox.id)
         .one(pools.read())
         .await?
-        .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(sandbox.name))
+        .ok_or_else(|| MicrosandboxError::SandboxNotFound(sandbox.name))
 }
 
 pub(super) async fn load_active_run(
@@ -1716,18 +1741,51 @@ pub(super) fn pid_is_alive(pid: i32) -> bool {
 }
 
 fn digest_pinned_reference(reference: &str, manifest_digest: &str) -> MicrosandboxResult<String> {
-    let image_ref: Reference = reference.parse().map_err(|e| {
-        crate::MicrosandboxError::InvalidConfig(format!("invalid image reference: {e}"))
-    })?;
+    let image_ref: Reference = reference
+        .parse()
+        .map_err(|e| MicrosandboxError::InvalidConfig(format!("invalid image reference: {e}")))?;
     let pinned = image_ref
         .clone_with_digest(manifest_digest.to_string())
         .to_string();
     pinned.parse::<Reference>().map_err(|e| {
-        crate::MicrosandboxError::InvalidConfig(format!(
-            "invalid pinned image reference '{pinned}': {e}"
-        ))
+        MicrosandboxError::InvalidConfig(format!("invalid pinned image reference '{pinned}': {e}"))
     })?;
     Ok(pinned)
+}
+
+/// Validate a sandbox name used by CLI and SDK APIs.
+///
+/// Names are UTF-8 strings and must be non-empty and no longer than
+/// [`MAX_SANDBOX_NAME_BYTES`] bytes. The limit is measured in bytes, not
+/// Unicode scalar values, because names are stored in fixed-size shared-memory
+/// metrics slots.
+pub fn validate_sandbox_name(name: &str) -> MicrosandboxResult<()> {
+    if let Some(message) = sandbox_name_validation_message(name) {
+        return Err(MicrosandboxError::InvalidConfig(message));
+    }
+
+    Ok(())
+}
+
+/// Validate sandbox-name-derived runtime paths before the sandbox process starts.
+pub(super) fn validate_sandbox_name_for_runtime(name: &str) -> MicrosandboxResult<()> {
+    validate_sandbox_name(name)?;
+    runtime::resolve_sandbox_agent_socket_path(name).map(|_| ())
+}
+
+pub(crate) fn sandbox_name_validation_message(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("sandbox name is required".into());
+    }
+
+    let len = name.len();
+    if len > MAX_SANDBOX_NAME_BYTES {
+        return Some(format!(
+            "sandbox name is too long: {len} bytes (max {MAX_SANDBOX_NAME_BYTES})"
+        ));
+    }
+
+    None
 }
 
 /// Pull an OCI image and return the pull result.
@@ -1750,9 +1808,9 @@ async fn pull_oci_image(
     let global = crate::config::config();
     let cache = GlobalCache::new(&global.cache_dir())?;
     let platform = microsandbox_image::Platform::host_linux();
-    let image_ref: Reference = reference.parse().map_err(|e| {
-        crate::MicrosandboxError::InvalidConfig(format!("invalid image reference: {e}"))
-    })?;
+    let image_ref: Reference = reference
+        .parse()
+        .map_err(|e| MicrosandboxError::InvalidConfig(format!("invalid image reference: {e}")))?;
     let options = PullOptions {
         pull_policy,
         ..Default::default()
@@ -1810,7 +1868,7 @@ async fn pull_oci_image(
         let task = registry.pull_with_sender(&image_ref, &options, sender);
         let result = task
             .await
-            .map_err(|e| crate::MicrosandboxError::Custom(format!("pull task panicked: {e}")))??;
+            .map_err(|e| MicrosandboxError::Custom(format!("pull task panicked: {e}")))??;
         Ok(result)
     } else {
         let result = registry.pull(&image_ref, &options).await?;
@@ -1823,14 +1881,14 @@ fn validate_rootfs_source(rootfs: &RootfsSource) -> MicrosandboxResult<()> {
     match rootfs {
         RootfsSource::Bind(path) => {
             if !path.exists() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                return Err(MicrosandboxError::InvalidConfig(format!(
                     "rootfs bind path does not exist: {}",
                     path.display()
                 )));
             }
 
             if !path.is_dir() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                return Err(MicrosandboxError::InvalidConfig(format!(
                     "rootfs bind path is not a directory: {}",
                     path.display()
                 )));
@@ -1838,26 +1896,26 @@ fn validate_rootfs_source(rootfs: &RootfsSource) -> MicrosandboxResult<()> {
         }
         RootfsSource::Oci(oci) => {
             if oci.reference.is_empty() {
-                return Err(crate::MicrosandboxError::InvalidConfig(
+                return Err(MicrosandboxError::InvalidConfig(
                     "image source is required".into(),
                 ));
             }
             if oci.upper_size_mib == Some(0) {
-                return Err(crate::MicrosandboxError::InvalidConfig(
+                return Err(MicrosandboxError::InvalidConfig(
                     "oci upper_size must be greater than 0".into(),
                 ));
             }
         }
         RootfsSource::DiskImage { path, .. } => {
             if !path.exists() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                return Err(MicrosandboxError::InvalidConfig(format!(
                     "disk image does not exist: {}",
                     path.display()
                 )));
             }
 
             if !path.is_file() {
-                return Err(crate::MicrosandboxError::InvalidConfig(format!(
+                return Err(MicrosandboxError::InvalidConfig(format!(
                     "disk image is not a regular file: {}",
                     path.display()
                 )));
@@ -1885,7 +1943,7 @@ pub(super) async fn load_sandbox_record(
         .filter(sandbox_entity::Column::Name.eq(name))
         .one(db)
         .await?
-        .ok_or_else(|| crate::MicrosandboxError::SandboxNotFound(name.into()))
+        .ok_or_else(|| MicrosandboxError::SandboxNotFound(name.into()))
 }
 
 async fn prepare_create_target(
@@ -1902,7 +1960,7 @@ async fn prepare_create_target(
 
     if !config.replace_existing {
         if existing.is_some() || dir_exists {
-            return Err(crate::MicrosandboxError::SandboxAlreadyExists(format!(
+            return Err(MicrosandboxError::SandboxAlreadyExists(format!(
                 "sandbox '{}' already exists; remove it, start the stopped sandbox, or recreate with .replace()",
                 config.name
             )));
@@ -2052,7 +2110,7 @@ async fn wait_for_pids_to_exit(pids: &[i32], timeout: std::time::Duration) {
 
 fn validate_start_state(config: &SandboxConfig, sandbox_dir: &Path) -> MicrosandboxResult<()> {
     if !sandbox_dir.exists() {
-        return Err(crate::MicrosandboxError::Custom(format!(
+        return Err(MicrosandboxError::Custom(format!(
             "sandbox state missing for '{}': {}",
             config.name,
             sandbox_dir.display()
@@ -2068,7 +2126,7 @@ fn validate_start_state(config: &SandboxConfig, sandbox_dir: &Path) -> Microsand
         {
             let vmdk_path = cache.vmdk_path(&digest);
             if !vmdk_path.exists() {
-                return Err(crate::MicrosandboxError::Custom(format!(
+                return Err(MicrosandboxError::Custom(format!(
                     "sandbox '{}' cannot start: VMDK missing: {}",
                     config.name,
                     vmdk_path.display()
@@ -2172,8 +2230,8 @@ async fn create_upper_ext4(
         ext4::format_ext4_with_tree(&path, &ext4_options, overlay_tree)
     })
     .await
-    .map_err(|e| crate::MicrosandboxError::Custom(format!("ext4 format task failed: {e}")))?
-    .map_err(|e| crate::MicrosandboxError::Custom(format!("failed to create upper.ext4: {e}")))?;
+    .map_err(|e| MicrosandboxError::Custom(format!("ext4 format task failed: {e}")))?
+    .map_err(|e| MicrosandboxError::Custom(format!("failed to create upper.ext4: {e}")))?;
 
     Ok(())
 }
@@ -2223,9 +2281,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        RootfsSource, SandboxConfig, SandboxStatus, digest_pinned_reference, insert_sandbox_record,
-        persist_oci_manifest_pin, prepare_create_target, reconcile_sandbox_runtime_state,
-        remove_dir_if_exists, validate_rootfs_source,
+        MAX_SANDBOX_NAME_BYTES, RootfsSource, SandboxConfig, SandboxStatus,
+        digest_pinned_reference, insert_sandbox_record, persist_oci_manifest_pin,
+        prepare_create_target, reconcile_sandbox_runtime_state, remove_dir_if_exists,
+        validate_rootfs_source, validate_sandbox_name_for_runtime,
     };
 
     /// Open both pools at `db_path` for tests, with migrations applied.
@@ -2382,6 +2441,40 @@ mod tests {
         validate_rootfs_source(&RootfsSource::Bind(path.clone())).unwrap();
 
         fs::remove_dir(path).unwrap();
+    }
+
+    #[test]
+    fn test_validate_sandbox_name_rejects_empty_name() {
+        let err = validate_sandbox_name_for_runtime("").unwrap_err();
+
+        assert_eq!(err.to_string(), "invalid config: sandbox name is required");
+    }
+
+    #[test]
+    fn test_validate_sandbox_name_accepts_128_byte_name() {
+        validate_sandbox_name_for_runtime(&"x".repeat(MAX_SANDBOX_NAME_BYTES)).unwrap();
+    }
+
+    #[test]
+    fn test_validate_sandbox_name_rejects_over_128_bytes() {
+        let err =
+            validate_sandbox_name_for_runtime(&"x".repeat(MAX_SANDBOX_NAME_BYTES + 1)).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid config: sandbox name is too long: 129 bytes (max 128)"
+        );
+    }
+
+    #[test]
+    fn test_validate_sandbox_name_limit_is_utf8_bytes() {
+        validate_sandbox_name_for_runtime(&"é".repeat(64)).unwrap();
+
+        let err = validate_sandbox_name_for_runtime(&"é".repeat(65)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid config: sandbox name is too long: 130 bytes (max 128)"
+        );
     }
 
     #[test]

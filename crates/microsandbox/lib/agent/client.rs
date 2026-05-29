@@ -17,7 +17,7 @@
 //!   primitives over [`Message`]; the SDK serializes payloads with CBOR.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
@@ -248,23 +248,40 @@ impl AgentClient {
 
     /// Resolve a sandbox name to its agent socket path and connect.
     ///
-    /// The socket lives under the SDK's configured sandboxes directory at
-    /// `<sandboxes_dir>/<name>/runtime/agent.sock`.
+    /// The socket lives under the SDK's configured runtime directory at a
+    /// short, name-derived path. Sandbox names are limited to 128 UTF-8 bytes.
     pub async fn connect_sandbox(name: &str) -> AgentClientResult<Self> {
         Self::connect_sandbox_with_timeout(name, DEFAULT_HANDSHAKE_TIMEOUT).await
     }
 
     /// Resolve a sandbox name to its agent socket path and connect with an
     /// explicit handshake timeout.
+    ///
+    /// Sandbox names are limited to 128 UTF-8 bytes.
     pub async fn connect_sandbox_with_timeout(
         name: &str,
         timeout: Duration,
     ) -> AgentClientResult<Self> {
-        let sock_path = sandbox_socket_path(name);
-        if !sock_path.exists() {
-            return Err(AgentClientError::SandboxNotFound(name.to_string()));
+        if let Some(message) = crate::sandbox::sandbox_name_validation_message(name) {
+            return Err(AgentClientError::InvalidSandboxName(message));
         }
-        Self::connect_with_timeout(&sock_path, timeout).await
+
+        let mut last_error = None;
+        for sock_path in crate::runtime::sandbox_agent_socket_path_candidates(name) {
+            if !sock_path.exists() {
+                continue;
+            }
+
+            match Self::connect_with_timeout(&sock_path, timeout).await {
+                Ok(client) => return Ok(client),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        match last_error {
+            Some(error) => Err(error),
+            None => Err(AgentClientError::SandboxNotFound(name.to_string())),
+        }
     }
 
     /// Close the connection. Drops the writer and aborts the reader task;
@@ -559,15 +576,6 @@ fn encode_message_body<T: Serialize>(
     let mut body = Vec::new();
     ciborium::into_writer(&msg, &mut body).map_err(microsandbox_protocol::ProtocolError::from)?;
     Ok(body)
-}
-
-/// Build the standard agent socket path for a sandbox name.
-fn sandbox_socket_path(name: &str) -> PathBuf {
-    crate::config::config()
-        .sandboxes_dir()
-        .join(name)
-        .join("runtime")
-        .join("agent.sock")
 }
 
 //--------------------------------------------------------------------------------------------------
